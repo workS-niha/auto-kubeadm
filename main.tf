@@ -100,6 +100,7 @@ resource "aws_route53_record" "www" {
   name     = "${each.key}.nirvanan.online"
   type     = "A"
   ttl      = "300"
+  allow_overwrite = true
   records  = [aws_instance.k8s_nodes[each.key].public_ip]
 }
 
