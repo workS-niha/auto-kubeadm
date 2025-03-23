@@ -1,0 +1,242 @@
+---
+- name: Install Dependencies on All Nodes
+  hosts: all
+  become: yes
+  tasks:
+    - name: Load required kernel modules
+      copy:
+        dest: /etc/modules-load.d/containerd.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Load kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Configure sysctl parameters for Kubernetes
+      copy:
+        dest: /etc/sysctl.d/kubernetes.conf
+        content: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+
+    - name: Apply sysctl settings
+      command: sysctl --system
+
+    - name: Install prerequisites
+      apt:
+        name:
+          - curl
+          - gnupg2
+          - software-properties-common
+          - apt-transport-https
+          - ca-certificates
+        state: present
+        update_cache: yes
+
+    - name: Add Docker GPG key
+      shell: curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmour -o /etc/apt/trusted.gpg.d/docker.gpg
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Install containerd
+      apt:
+        name: containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Generate default containerd config
+      command: containerd config default
+      register: containerd_config
+
+    - name: Save containerd config
+      copy:
+        dest: /etc/containerd/config.toml
+        content: "{{ containerd_config.stdout }}"
+
+    - name: Enable SystemdCgroup in containerd
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: Restart and enable containerd service
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+
+    - name: Remove old Kubernetes keyring file (if exists)
+      ansible.builtin.file:
+        path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        state: absent
+
+    - name: Create directory for Kubernetes keyring
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download and add Kubernetes repository key
+      ansible.builtin.shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.32/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Remove old Kubernetes repository files (if exists)
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/kubernetes.list
+        state: absent
+
+    - name: Add Kubernetes repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.32/deb/ /
+        mode: '0644'
+
+    - name: Update APT package list again
+      ansible.builtin.apt:
+        update_cache: yes
+
+    - name: Install kubeadm, kubelet, and kubectl
+      ansible.builtin.apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Enable and start kubelet service
+      service:
+        name: kubelet
+        state: started
+        enabled: yes
+
+    - name: Hold Kubernetes packages to prevent automatic upgrades
+      ansible.builtin.command: apt-mark hold kubelet kubeadm kubectl
+
+- name: Initialize Kubernetes Master
+  hosts: master1
+  become: yes
+  tasks:
+    
+    - name: Initialize kubeadm
+      ansible.builtin.command: kubeadm init --pod-network-cidr=192.168.0.0/16
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Get join command
+      ansible.builtin.command: kubeadm token create --print-join-command
+      register: join_command
+      changed_when: false
+
+    - name: Save join command to temporary file
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.copy:
+        content: "{{ join_command.stdout }}"
+        dest: "/tmp/join_command.txt"
+
+    - name: Read join command from temporary file
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.slurp:
+        src: "/tmp/join_command.txt"
+      register: join_command_file
+
+    - name: Ensure .kube directory exists
+      file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Copy kubeconfig file
+      copy:
+          src: /etc/kubernetes/admin.conf
+          dest: /home/ubuntu/.kube/config
+          remote_src: yes
+          owner: ubuntu
+          group: ubuntu
+          mode: '0644'
+
+    - name: Set KUBECONFIG environment variable
+      lineinfile:
+        path: /home/ubuntu/.bashrc
+        line: 'export KUBECONFIG=/home/ubuntu/.kube/config'
+
+    - name: Apply the KUBECONFIG
+      shell: bash -c "source /home/ubuntu/.bashrc"
+
+  
+    - name: Download Calico manifest
+      get_url:
+        url: "https://raw.githubusercontent.com/projectcalico/calico/v3.29.2/manifests/calico.yaml"
+        dest: "/home/ubuntu/calico.yaml"
+        mode: '0644'
+
+    - name: Apply Calico network plugin
+      command: kubectl apply -f /home/ubuntu/calico.yaml
+      become_user: ubuntu
+
+    - name: Clone kubectx repository
+      ansible.builtin.git:
+        repo: "https://github.com/ahmetb/kubectx.git"
+        dest: "/opt/kubectx"
+        version: "master"
+
+    - name: Create symbolic link for kubectx
+      ansible.builtin.file:
+        src: "/opt/kubectx/kubectx"
+        dest: "/usr/local/bin/kubectx"
+        state: link
+
+    - name: Create symbolic link for kubens
+      ansible.builtin.file:
+        src: "/opt/kubectx/kubens"
+        dest: "/usr/local/bin/kubens"
+        state: link
+
+    - name: Download and install k9s
+      ansible.builtin.shell: curl -sS https://webinstall.dev/k9s | bash
+      args:
+        creates: /usr/local/bin/k9s
+
+    - name: Add alias k='kubectl' to .bashrc
+      lineinfile:
+        path: /home/ubuntu/.bashrc
+        line: "alias k='kubectl'"
+        create: yes
+        state: present
+
+- name: Join Worker Nodes
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Fetch join command from control node
+      ansible.builtin.slurp:
+        src: "/tmp/join_command.txt"
+      delegate_to: localhost
+      run_once: true
+      register: join_command_file
+
+    - name: Convert join command to string
+      ansible.builtin.set_fact:
+        join_command: "{{ join_command_file['content'] | b64decode | trim }}"
+
+    - name: Join Kubernetes cluster
+      ansible.builtin.command: "{{ join_command }}"
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+# Hello
